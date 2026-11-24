@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	nethttp "net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -176,6 +178,44 @@ func isGitTokenPresent(gitURL giturl.IGitAPI) bool {
 	return true
 }
 
+// GitTokenHostsEnvVar names extra hosts, comma separated, that may receive a
+// git provider token, for example a self-hosted GitLab or Azure DevOps Server.
+const GitTokenHostsEnvVar = "KUBESCAPE_GIT_TOKEN_HOSTS"
+
+// defaultGitTokenHosts are the public hosts of the supported providers.
+// go-git-url recognises providers loosely - GitLab is any host containing
+// "gitlab" or starting with "git.", Azure is any host ending in "azure.com"
+// (which includes "notazure.com") - and keeps the host from the URL, so the
+// provider alone does not say whether a host should get the token.
+var defaultGitTokenHosts = []string{"github.com", "gitlab.com", "dev.azure.com", "bitbucket.org"}
+
+// isGitTokenHostTrusted reports whether the token for the repository may be
+// sent to the host of cloneURL: one of the providers' public hosts, the GitLab
+// instance a GitLab CI job runs on (CI_SERVER_HOST), or a host the user listed
+// in KUBESCAPE_GIT_TOKEN_HOSTS. Any other host is only cloned anonymously, so
+// scanning an untrusted URL cannot send it GITLAB_TOKEN or AZURE_TOKEN.
+func isGitTokenHostTrusted(cloneURL string) bool {
+	u, err := url.Parse(cloneURL)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	trusted := append([]string{}, defaultGitTokenHosts...)
+	trusted = append(trusted, SplitCommaList(os.Getenv(GitTokenHostsEnvVar))...)
+	if ciHost := strings.TrimSpace(os.Getenv("CI_SERVER_HOST")); ciHost != "" {
+		trusted = append(trusted, ciHost)
+	}
+	for _, h := range trusted {
+		if strings.EqualFold(h, host) {
+			return true
+		}
+	}
+	return false
+}
+
 // getProviderError returns an appropriate missing token error for the git provider.
 func getProviderError(gitURL giturl.IGitAPI) error {
 	switch gitURL.GetProvider() {
@@ -239,22 +279,29 @@ func cloneRepo(gitURL giturl.IGitAPI, depthOpt ...int) (string, error) {
 		}()
 
 		isGitTokenPresent := isGitTokenPresent(gitURL)
+		tokenHostTrusted := isGitTokenHostTrusted(cloneURL)
 
 		// Declare the authentication variable required for cloneOptions
 		var auth transport.AuthMethod
 
-		if isGitTokenPresent {
+		switch {
+		case isGitTokenPresent && tokenHostTrusted:
 			auth = &http.BasicAuth{
 				Username: "x-token-auth",
 				Password: gitURL.GetToken(),
 			}
-		} else {
+		case isGitRepoPublic(cloneURL):
 			// If the repository is public, no authentication is needed
-			if isGitRepoPublic(cloneURL) {
-				auth = nil
-			} else {
-				return "", getProviderError(gitURL)
+			auth = nil
+			if isGitTokenPresent {
+				logger.L().Warning("not sending the git token to a host that is not trusted; cloning anonymously",
+					helpers.String("host", gitURL.GetHostName()),
+					helpers.String("hint", "add the host to "+GitTokenHostsEnvVar+" to authenticate"))
 			}
+		case isGitTokenPresent:
+			return "", fmt.Errorf("refusing to send the git token to untrusted host %q: add it to %s if it is your git server", gitURL.GetHostName(), GitTokenHostsEnvVar)
+		default:
+			return "", getProviderError(gitURL)
 		}
 
 		// Clone option

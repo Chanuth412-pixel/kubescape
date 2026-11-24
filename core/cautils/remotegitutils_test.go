@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	giturl "github.com/kubescape/go-git-url"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -476,4 +477,72 @@ func TestGetFileLastCommit_ShallowVsFullClone(t *testing.T) {
 		assert.Equal(t, commit2Hash.String(), commit2.SHA)
 		assert.Equal(t, "New Author", commit2.Author.Name)
 	})
+}
+
+func TestIsGitTokenHostTrusted(t *testing.T) {
+	tests := []struct {
+		name     string
+		cloneURL string
+		envHosts string
+		ciHost   string
+		want     bool
+	}{
+		{name: "github.com", cloneURL: "https://github.com/o/r.git", want: true},
+		{name: "gitlab.com", cloneURL: "https://gitlab.com/o/r.git", want: true},
+		{name: "dev.azure.com", cloneURL: "https://dev.azure.com/o/p/_git/r", want: true},
+		{name: "bitbucket.org", cloneURL: "https://bitbucket.org/o/r.git", want: true},
+		{name: "host case is ignored", cloneURL: "https://GitLab.com/o/r.git", want: true},
+		{name: "lookalike gitlab host", cloneURL: "https://gitlab.attacker.example/o/r.git", want: false},
+		{name: "git. prefix host", cloneURL: "https://git.attacker.example/o/r.git", want: false},
+		{name: "azure.com suffix without dot", cloneURL: "https://notazure.com/o/p/_git/r", want: false},
+		{name: "plain http", cloneURL: "http://gitlab.com/o/r.git", want: false},
+		{name: "unparsable", cloneURL: "://", want: false},
+		{name: "host from env", cloneURL: "https://gitlab.corp.example/o/r.git", envHosts: "other.example, gitlab.corp.example", want: true},
+		{name: "host with port from env", cloneURL: "https://gitlab.corp.example:8443/o/r.git", envHosts: "gitlab.corp.example", want: true},
+		{name: "GitLab CI server host", cloneURL: "https://gitlab.corp.example/o/r.git", ciHost: "gitlab.corp.example", want: true},
+		{name: "env does not trust other hosts", cloneURL: "https://gitlab.attacker.example/o/r.git", envHosts: "gitlab.corp.example", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(GitTokenHostsEnvVar, tt.envHosts)
+			t.Setenv("CI_SERVER_HOST", tt.ciHost)
+			assert.Equal(t, tt.want, isGitTokenHostTrusted(tt.cloneURL))
+		})
+	}
+}
+
+// A token must never reach a host that go-git-url only recognises by name
+// (any host containing "gitlab"). The .invalid TLD never resolves, so the
+// public check fails and the clone has to be refused before it is attempted.
+func TestCloneRepoDoesNotSendTokenToUntrustedHost(t *testing.T) {
+	t.Setenv(GitTokenHostsEnvVar, "")
+	t.Setenv("CI_SERVER_HOST", "")
+	resetRepoWorkspaceState(t)
+	cloned := false
+	useFakeClone(t, func(path string, _ bool, options *git.CloneOptions) (*git.Repository, error) {
+		cloned = true
+		return initializeCloneWorkspace(path, options)
+	})
+
+	_, err := cloneRepo(authenticatedGitURL(t, "https://gitlab.attacker.invalid/owner/repo"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to send the git token")
+	assert.False(t, cloned, "clone must not be attempted with the token")
+}
+
+func TestCloneRepoSendsTokenToHostListedInEnv(t *testing.T) {
+	t.Setenv(GitTokenHostsEnvVar, "gitlab.corp.invalid")
+	resetRepoWorkspaceState(t)
+	var capturedOpts *git.CloneOptions
+	useFakeClone(t, func(path string, _ bool, options *git.CloneOptions) (*git.Repository, error) {
+		capturedOpts = options
+		return initializeCloneWorkspace(path, options)
+	})
+
+	_, err := cloneRepo(authenticatedGitURL(t, "https://gitlab.corp.invalid/owner/repo"))
+	require.NoError(t, err)
+	require.NotNil(t, capturedOpts)
+	auth, ok := capturedOpts.Auth.(*githttp.BasicAuth)
+	require.True(t, ok, "expected basic auth for a trusted host")
+	assert.Equal(t, "test-token", auth.Password)
 }
